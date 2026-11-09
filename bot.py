@@ -333,7 +333,9 @@ async def main():
     await user_client.connect()  # вход — командой /login в боте
     await bot.start(bot_token=BOT_TOKEN)
     print("Channel Cleaner запущен")
-    await asyncio.gather(user_client.run_until_disconnected(), bot.run_until_disconnected())
+    # user_client.run_until_disconnected() не используем: до /login он падает с AuthKeyUnregistered.
+    # Аккаунту обновления не нужны — он остаётся подключён и выполняет запросы по требованию.
+    await bot.run_until_disconnected()
 
 
 if __name__ == "__main__":
