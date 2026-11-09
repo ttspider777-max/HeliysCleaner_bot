@@ -21,7 +21,10 @@ from telethon.tl.types import Channel, ChannelParticipantAdmin, ChannelParticipa
 
 from scoring import LABELS, evaluate
 
-load_dotenv()
+_here = Path(__file__).resolve().parent
+# .env может не загрузиться на хосте (файлы с точкой часто игнорируются), поэтому есть settings.env
+for _name in (".env", "settings.env"):
+    load_dotenv(_here / _name)
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
