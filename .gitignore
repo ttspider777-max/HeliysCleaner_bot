@@ -1,0 +1,6 @@
+.env
+settings.env
+local_config.py
+data/
+__pycache__/
+*.session

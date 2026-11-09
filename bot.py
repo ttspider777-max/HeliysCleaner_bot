@@ -25,6 +25,10 @@ _here = Path(__file__).resolve().parent
 # .env может не загрузиться на хосте (файлы с точкой часто игнорируются), поэтому есть settings.env
 for _name in (".env", "settings.env"):
     load_dotenv(_here / _name)
+try:
+    import local_config  # noqa: F401  — необязательный локальный файл с запасными значениями (в репозиторий не кладём)
+except ImportError:
+    pass
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
