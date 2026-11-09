@@ -5,14 +5,18 @@
   * бот — интерфейс управления (/scan, кнопки подтверждения).
 """
 import asyncio
+import io
 import json
 import os
+import re
 from collections import Counter
 from pathlib import Path
 
+import qrcode
 from dotenv import load_dotenv
 from telethon import Button, TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.sessions import StringSession
 from telethon.tl.types import Channel, ChannelParticipantAdmin, ChannelParticipantCreator
 
 from scoring import LABELS, evaluate
@@ -25,12 +29,17 @@ OWNERS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split
 DEFAULT_THRESHOLD = int(os.environ.get("THRESHOLD", "4"))
 KICK_DELAY = float(os.environ.get("KICK_DELAY", "1.0"))
 
-DATA = Path("data")
-DATA.mkdir(exist_ok=True)
+# На хостах с постоянным диском (Amvera: /data) сессия должна лежать там, иначе слетит при обновлении
+DATA = Path(os.environ.get("DATA_DIR") or ("/data" if os.path.isdir("/data") else "data"))
+DATA.mkdir(parents=True, exist_ok=True)
 WL_FILE = DATA / "whitelist.json"
 
-user_client = TelegramClient(str(DATA / "user"), API_ID, API_HASH)
-bot = TelegramClient(str(DATA / "bot"), API_ID, API_HASH)
+SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
+# На хосте нет консоли для ввода кода, поэтому сессия берётся из SESSION_STRING (см. gen_session.py)
+user_client = TelegramClient(
+    StringSession(SESSION_STRING) if SESSION_STRING else str(DATA / "user"), API_ID, API_HASH
+)
+bot = TelegramClient(StringSession(), API_ID, API_HASH)
 
 # последний скан на владельца: {owner_id: {"channel": entity, "ids": [..], "stats": Counter}}
 scans: dict[int, dict] = {}
@@ -57,12 +66,119 @@ def owner_only(handler):
     return wrap
 
 
+# ---------- вход в аккаунт прямо из бота ----------
+login_state: dict[int, dict] = {}  # {owner_id: {"step": "code"|"password"|"qr", ...}}
+
+
+async def _qr_flow(chat_id: int, oid: int):
+    """Показывает QR, ждёт сканирования; при устаревании обновляет (до 4 раз)."""
+    try:
+        qr = await user_client.qr_login()
+        for _ in range(4):
+            buf = io.BytesIO()
+            qrcode.make(qr.url).save(buf, format="PNG")
+            buf.seek(0)
+            buf.name = "qr.png"
+            await bot.send_file(
+                chat_id, buf,
+                caption="Telegram на телефоне → Настройки → Устройства → Подключить устройство → "
+                        "наведите камеру на этот QR. Действует ~1 минуту.",
+            )
+            try:
+                await qr.wait(60)
+                break
+            except asyncio.TimeoutError:
+                await qr.recreate()
+            except SessionPasswordNeededError:
+                login_state[oid] = {"step": "password"}
+                return await bot.send_message(chat_id, "🔐 Включена двухэтапная защита. Отправьте пароль (сообщение сразу удалится).")
+        else:
+            login_state.pop(oid, None)
+            return await bot.send_message(chat_id, "QR не отсканировали. Повторите /login.")
+        login_state.pop(oid, None)
+        me = await user_client.get_me()
+        await bot.send_message(chat_id, f"✅ Вошёл как {me.first_name} (id {me.id}). Теперь можно /scan.")
+    except Exception as e:
+        login_state.pop(oid, None)
+        await bot.send_message(chat_id, f"Ошибка входа: {e}")
+
+
+@bot.on(events.NewMessage(pattern=r"^/login(?:\s+(\+?\d[\d\s\-]{5,}))?\s*$"))
+@owner_only
+async def cmd_login(event):
+    oid = event.sender_id
+    if await user_client.is_user_authorized():
+        me = await user_client.get_me()
+        return await event.respond(f"Уже вошёл как {me.first_name}. Для смены аккаунта: /logout")
+    phone = event.pattern_match.group(1)
+    if not phone:
+        login_state[oid] = {"step": "qr"}
+        asyncio.create_task(_qr_flow(event.chat_id, oid))
+        return
+    phone = "+" + re.sub(r"\D", "", phone)
+    try:
+        sent = await user_client.send_code_request(phone)
+    except Exception as e:
+        return await event.respond(f"Не удалось отправить код: {e}\nПопробуйте вход по QR: /login")
+    login_state[oid] = {"step": "code", "phone": phone, "hash": sent.phone_code_hash}
+    await event.respond(
+        "Код отправлен сообщением в приложение Telegram (чат «Telegram»).\n"
+        "Отправьте его сюда **с пробелами или дефисами**, например `1 2 3 4 5`: "
+        "если написать цифры слитно, Telegram аннулирует код."
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/logout$"))
+@owner_only
+async def cmd_logout(event):
+    await user_client.log_out()
+    await user_client.connect()
+    await event.respond("Вышел из аккаунта. /login — войти снова.")
+
+
+@bot.on(events.NewMessage(func=lambda e: e.is_private and e.sender_id in login_state
+                          and not (e.raw_text or "").startswith("/")))
+async def on_login_input(event):
+    oid = event.sender_id
+    if oid not in OWNERS:
+        return
+    st = login_state.get(oid)
+    text = event.raw_text.strip()
+    try:
+        if st["step"] == "code":
+            code = re.sub(r"\D", "", text)
+            await user_client.sign_in(st["phone"], code, phone_code_hash=st["hash"])
+        elif st["step"] == "password":
+            await user_client.sign_in(password=text)
+        else:
+            return
+    except SessionPasswordNeededError:
+        login_state[oid] = {"step": "password"}
+        await event.respond("🔐 Включена двухэтапная защита. Отправьте пароль (сообщение сразу удалится).")
+        return
+    except Exception as e:
+        login_state.pop(oid, None)
+        await event.respond(f"Ошибка: {e}\nНачните заново: /login")
+        return
+    finally:
+        try:
+            await event.delete()  # не оставляем код/пароль в чате
+        except Exception:
+            pass
+    login_state.pop(oid, None)
+    me = await user_client.get_me()
+    await bot.send_message(event.chat_id, f"✅ Вошёл как {me.first_name} (id {me.id}). Теперь можно /scan.")
+
+
 @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
 @owner_only
 async def cmd_start(event):
+    authed = await user_client.is_user_authorized()
     await event.respond(
         "🧹 **Channel Cleaner**\n\n"
-        "1. Сделайте аккаунт, под которым запущен бот, админом канала с правом «Блокировка пользователей».\n"
+        + ("" if authed else "⚠️ Сначала войдите в аккаунт-админ канала: /login (по QR) "
+                             "или `/login +79991234567`.\n\n")
+        + "1. Сделайте аккаунт админом канала с правом «Блокировка пользователей».\n"
         "2. `/scan @channel` — проверить подписчиков (ничего не удаляет).\n"
         "3. Посмотрите отчёт и нажмите кнопку удаления.\n\n"
         f"`/threshold N` — порог баллов (сейчас {settings['threshold']}). Удалённый/fake/scam = сразу, "
@@ -104,6 +220,8 @@ async def cmd_wl(event):
 @owner_only
 async def cmd_scan(event):
     oid = event.sender_id
+    if not await user_client.is_user_authorized():
+        return await event.respond("Аккаунт не подключён. Сначала /login.")
     if oid in busy:
         return await event.respond("Уже идёт операция, подождите.")
     busy.add(oid)
@@ -205,7 +323,7 @@ async def run_clean(event, sc):
 
 
 async def main():
-    await user_client.start()  # при первом запуске спросит телефон и код
+    await user_client.connect()  # вход — командой /login в боте
     await bot.start(bot_token=BOT_TOKEN)
     print("Channel Cleaner запущен")
     await asyncio.gather(user_client.run_until_disconnected(), bot.run_until_disconnected())
