@@ -46,7 +46,8 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 user_client = TelegramClient(
     StringSession(SESSION_STRING) if SESSION_STRING else str(DATA / "user"), API_ID, API_HASH
 )
-bot = TelegramClient(StringSession(), API_ID, API_HASH)
+# сессия бота хранится в файле, чтобы не логиниться по токену при каждом перезапуске (иначе FloodWait)
+bot = TelegramClient(str(DATA / "bot"), API_ID, API_HASH)
 
 # последний скан на владельца: {owner_id: {"channel": entity, "ids": [..], "stats": Counter}}
 scans: dict[int, dict] = {}
@@ -331,7 +332,14 @@ async def run_clean(event, sc):
 
 async def main():
     await user_client.connect()  # вход — командой /login в боте
-    await bot.start(bot_token=BOT_TOKEN)
+    while True:
+        try:
+            await bot.start(bot_token=BOT_TOKEN)
+            break
+        except FloodWaitError as e:
+            # ждём внутри процесса: падение и перезапуск хоста только продлили бы ограничение
+            print(f"FloodWait при входе бота: жду {e.seconds + 5} с")
+            await asyncio.sleep(e.seconds + 5)
     print("Channel Cleaner запущен")
     # user_client.run_until_disconnected() не используем: до /login он падает с AuthKeyUnregistered.
     # Аккаунту обновления не нужны — он остаётся подключён и выполняет запросы по требованию.
